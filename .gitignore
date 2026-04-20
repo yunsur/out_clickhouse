@@ -1,0 +1,5 @@
+.DS_Store
+.worktrees
+.env
+out_clickhouse.h
+out_clickhouse.so
