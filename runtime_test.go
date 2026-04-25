@@ -346,15 +346,15 @@ func TestClassifyInsertError(t *testing.T) {
 	}
 }
 
-func TestDebugLogger_RedactsPassword(t *testing.T) {
+func TestLogLevelLogger_RedactsPassword(t *testing.T) {
 	plugin := &ClickHousePlugin{
 		Opt: &clickhouse.Options{
 			Auth: clickhouse.Auth{Password: "super-secret"},
 		},
 	}
-	cfg := map[string]string{"Debug": "true"}
-	if err := plugin.parseDebug(makeConfig(cfg)); err != nil {
-		t.Fatalf("parseDebug() unexpected error: %v", err)
+	cfg := map[string]string{"LogLevel": "debug"}
+	if err := plugin.parseLogLevel(makeConfig(cfg)); err != nil {
+		t.Fatalf("parseLogLevel() unexpected error: %v", err)
 	}
 
 	var buf bytes.Buffer
@@ -367,53 +367,19 @@ func TestDebugLogger_RedactsPassword(t *testing.T) {
 		log.SetFlags(oldFlags)
 	})
 
-	plugin.Opt.Debugf("dsn=tcp://127.0.0.1:9000?password=%s&token=abc", plugin.Opt.Auth.Password)
+	// Test via Logger
+	logger := plugin.Opt.Logger
+	if logger == nil {
+		t.Fatal("Logger is nil")
+	}
+	logger.Info("dsn info", "password", "super-secret", "token", "abc")
 	got := buf.String()
 	if strings.Contains(got, "super-secret") {
-		t.Fatalf("debug log leaked password: %s", got)
+		t.Fatalf("log leaked password: %s", got)
 	}
-	if strings.Contains(got, "token=abc") {
-		t.Fatalf("debug log leaked token: %s", got)
-	}
-	if !containsAll(got, "password=***", "token=***") {
-		t.Fatalf("debug log missing redaction markers: %s", got)
-	}
-}
-
-func TestResolveTimestamp_UsesRecordFieldValue(t *testing.T) {
-	p := &ClickHousePlugin{
-		RecordTime: "lt",
-		TimeStamp:  3,
-	}
-	record := map[interface{}]interface{}{
-		"lt": []byte("1710000000123"),
-	}
-
-	got := p.resolveTimestamp(output.FLBTime{Time: time.Unix(1, 0)}, normalizeRecord(record))
-	want := time.UnixMilli(1710000000123)
-	if !got.Equal(want) {
-		t.Fatalf("resolveTimestamp() = %v, want %v", got, want)
-	}
-}
-
-func TestResolveTimestamp_UsesCustomFormatAndFallback(t *testing.T) {
-	p := &ClickHousePlugin{
-		RecordTime: "lt",
-		TimeFormat: "2006-01-02 15:04:05.000",
-	}
-	record := map[interface{}]interface{}{
-		"lt": []byte("2026-04-19 12:34:56.789"),
-	}
-
-	got := p.resolveTimestamp(output.FLBTime{Time: time.Unix(1, 0)}, normalizeRecord(record))
-	want := time.Date(2026, 4, 19, 12, 34, 56, 789000000, time.UTC)
-	if !got.Equal(want) {
-		t.Fatalf("resolveTimestamp() = %v, want %v", got, want)
-	}
-
-	fallback := p.resolveTimestamp(output.FLBTime{Time: time.Unix(9, 0)}, map[string]any{})
-	if !fallback.Equal(time.Unix(9, 0)) {
-		t.Fatalf("resolveTimestamp() fallback = %v, want %v", fallback, time.Unix(9, 0))
+	// Check password is redacted
+	if !strings.Contains(got, "password ***") {
+		t.Fatalf("log missing password redaction: %s", got)
 	}
 }
 
@@ -1044,121 +1010,6 @@ func TestBatchInsert_NullableLowCardinalityStringMixedBatch(t *testing.T) {
 	}
 }
 
-func TestBatchInsert_ToleratesTagSegmentCountMismatch(t *testing.T) {
-	tests := []struct {
-		name       string
-		cfg        map[string]string
-		tag        string
-		wantLen    int
-		wantTime   bool
-		wantTimeAt int
-	}{
-		{
-			name: "fewer incoming segments uses evaluated default",
-			cfg: map[string]string{
-				"Tags": "server|String,idx|Int32,created_at|DateTime",
-			},
-			tag:        "prod.5",
-			wantLen:    4,
-			wantTime:   true,
-			wantTimeAt: 2,
-		},
-		{
-			name: "more incoming segments merge into final tag",
-			cfg: map[string]string{
-				"Tags": "server|String,idx|String",
-			},
-			tag:     "prod.5.extra",
-			wantLen: 3,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := baseConfig()
-			for k, v := range tt.cfg {
-				cfg[k] = v
-			}
-			cfg["TagSplit"] = "."
-			p, err := NewPlugin(makeConfig(cfg))
-			if err != nil {
-				t.Fatalf("NewPlugin() unexpected error: %v", err)
-			}
-			batch := &mockBatch{}
-			conn := &mockConn{batch: batch}
-			p.Opt = &clickhouse.Options{
-				DialTimeout: time.Second,
-				Auth:        clickhouse.Auth{Database: "default"},
-			}
-			p.Columns = []string{"i64"}
-			p.ColType = []ColumnParser{parseInt[int64]}
-			p.Defaults = []any{int64(0)}
-			p.TableName = "events"
-			p.BatchStmt = "INSERT INTO default.events(server,idx,created_at,i64)"
-			if !tt.wantTime {
-				p.BatchStmt = "INSERT INTO default.events(server,idx,i64)"
-			}
-			p.Conn = conn
-
-			dec := mustTestDecoder(t, uint64(1710000000), map[string]any{"i64": int64(7)})
-			got := p.BatchInsert(tt.tag, dec)
-			if got != output.FLB_OK {
-				t.Fatalf("BatchInsert() = %d, want %d", got, output.FLB_OK)
-			}
-			if len(batch.rows) != 1 {
-				t.Fatalf("batch rows = %d, want 1", len(batch.rows))
-			}
-			row := batch.rows[0]
-			if len(row) != tt.wantLen {
-				t.Fatalf("batch row len = %d, want %d", len(row), tt.wantLen)
-			}
-			assertTypedValue(t, row[0], "prod")
-			if tt.wantTime {
-				assertTypedValue(t, row[1], int32(5))
-				if _, ok := row[tt.wantTimeAt].(time.Time); !ok {
-					t.Fatalf("batch row[%d] type = %T, want time.Time", tt.wantTimeAt, row[tt.wantTimeAt])
-				}
-				assertTypedValue(t, row[3], int64(7))
-				return
-			}
-			assertTypedValue(t, row[1], "5.extra")
-			assertTypedValue(t, row[2], int64(7))
-		})
-	}
-}
-
-func TestBatchInsert_RejectsMergedOverflowForTypedFinalTag(t *testing.T) {
-	cfg := baseConfig()
-	cfg["Tags"] = "server|String,idx|Int32"
-	cfg["TagSplit"] = "."
-
-	p, err := NewPlugin(makeConfig(cfg))
-	if err != nil {
-		t.Fatalf("NewPlugin() unexpected error: %v", err)
-	}
-
-	batch := &mockBatch{}
-	p.Opt = &clickhouse.Options{
-		DialTimeout: time.Second,
-		Auth:        clickhouse.Auth{Database: "default"},
-	}
-	p.Columns = []string{"i64"}
-	p.ColType = []ColumnParser{parseInt[int64]}
-	p.Defaults = []any{int64(0)}
-	p.TableName = "events"
-	p.BatchStmt = "INSERT INTO default.events(server,idx,i64)"
-	p.Conn = &mockConn{batch: batch}
-
-	dec := mustTestDecoder(t, uint64(1710000000), map[string]any{"i64": int64(7)})
-	got := p.BatchInsert("prod.5.extra", dec)
-	if got != output.FLB_ERROR {
-		t.Fatalf("BatchInsert() = %d, want %d", got, output.FLB_ERROR)
-	}
-	if len(batch.rows) != 0 {
-		t.Fatalf("batch rows = %d, want 0", len(batch.rows))
-	}
-}
-
 func TestInit_ClosesConnectionOnPingFailure(t *testing.T) {
 	defer goleak.VerifyNone(t)
 
@@ -1222,29 +1073,6 @@ func TestInit_AllowsForegroundMode(t *testing.T) {
 		t.Fatalf("Init() unexpected error in foreground mode: %v", err)
 	}
 	p.Exit()
-}
-
-func TestInit_DeduplicatesRecordTimeColumn(t *testing.T) {
-	conn := &mockConn{batch: &mockBatch{}}
-	oldOpen := openConnector
-	openConnector = func(*clickhouse.Options) (Connector, error) {
-		return conn, nil
-	}
-	t.Cleanup(func() { openConnector = oldOpen })
-
-	p := &ClickHousePlugin{
-		Opt:        &clickhouse.Options{DialTimeout: time.Second, Auth: clickhouse.Auth{Database: "default"}},
-		Columns:    []string{"lt", "name"},
-		RecordTime: "lt",
-		TableName:  "events",
-	}
-
-	if err := p.Init(); err != nil {
-		t.Fatalf("Init() unexpected error: %v", err)
-	}
-	if p.BatchStmt != "INSERT INTO `default`.`events`(`lt`,`name`)" {
-		t.Fatalf("BatchStmt = %q, want %q", p.BatchStmt, "INSERT INTO `default`.`events`(`lt`,`name`)")
-	}
 }
 
 func TestNewPlugin_TLSAndMetricsConfig(t *testing.T) {

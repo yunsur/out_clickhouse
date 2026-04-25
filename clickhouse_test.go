@@ -26,9 +26,7 @@ func makeConfig(m map[string]string) func(string, ...string) string {
 // baseConfig returns minimum required config for a valid plugin.
 func baseConfig() map[string]string {
 	return map[string]string{
-		"TCP":      "127.0.0.1:9000",
-		"DB":       "default",
-		"UserName": "default",
+		"Database": "default",
 		"Table":    "test_table",
 		"Columns":  "id|Int64,name|String",
 	}
@@ -40,9 +38,7 @@ func TestNewPlugin_RequiredFields(t *testing.T) {
 		omitField string
 		wantErr   error
 	}{
-		{name: "missing TCP and HTTP", omitField: "TCP", wantErr: ErrNoAddress},
-		{name: "missing DB", omitField: "DB", wantErr: ErrNoDB},
-		{name: "missing UserName", omitField: "UserName", wantErr: ErrNoUserName},
+		{name: "missing Database", omitField: "Database", wantErr: ErrNoDatabase},
 		{name: "missing Table", omitField: "Table", wantErr: ErrNoTable},
 		{name: "missing Columns", omitField: "Columns", wantErr: ErrNoColumns},
 	}
@@ -62,40 +58,108 @@ func TestNewPlugin_RequiredFields(t *testing.T) {
 	}
 }
 
-func TestNewPlugin_ValidConfig(t *testing.T) {
+func TestNewPlugin_DefaultValues(t *testing.T) {
 	cfg := baseConfig()
 	p, err := NewPlugin(makeConfig(cfg))
 	if err != nil {
 		t.Fatalf("NewPlugin() unexpected error: %v", err)
 	}
-	if p.TableName != "test_table" {
-		t.Errorf("TableName = %q, want %q", p.TableName, "test_table")
+	// Verify default Addr matches clickhouse-go defaults for Native protocol.
+	if len(p.Opt.Addr) != 1 || p.Opt.Addr[0] != "localhost:9000" {
+		t.Errorf("Addr = %v, want [localhost:9000] (clickhouse-go default for native)", p.Opt.Addr)
 	}
-	if len(p.Opt.Addr) != 1 || p.Opt.Addr[0] != "127.0.0.1:9000" {
-		t.Errorf("Addr = %v, want [127.0.0.1:9000]", p.Opt.Addr)
+	// Verify default Protocol is Native.
+	if p.Opt.Protocol != clickhouse.Native {
+		t.Errorf("Protocol = %v, want Native (clickhouse-go default)", p.Opt.Protocol)
+	}
+	// Verify default Username matches clickhouse-go defaults.
+	if p.Opt.Auth.Username != "default" {
+		t.Errorf("Username = %q, want %q (clickhouse-go default)", p.Opt.Auth.Username, "default")
 	}
 	if p.Opt.Auth.Database != "default" {
 		t.Errorf("Database = %q, want %q", p.Opt.Auth.Database, "default")
 	}
 }
 
-func TestNewPlugin_HTTPProtocol(t *testing.T) {
-	cfg := baseConfig()
-	delete(cfg, "TCP")
-	cfg["HTTP"] = "127.0.0.1:8123"
+func TestNewPlugin_Protocol(t *testing.T) {
+	tests := []struct {
+		name         string
+		protocol     string
+		wantProtocol clickhouse.Protocol
+		wantErr      bool
+	}{
+		{name: "empty defaults to native", protocol: "", wantProtocol: clickhouse.Native},
+		{name: "native", protocol: "native", wantProtocol: clickhouse.Native},
+		{name: "http", protocol: "http", wantProtocol: clickhouse.HTTP},
+		{name: "invalid", protocol: "invalid", wantErr: true},
+	}
 
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseConfig()
+			if tt.protocol != "" {
+				cfg["Protocol"] = tt.protocol
+			}
+			p, err := NewPlugin(makeConfig(cfg))
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if p.Opt.Protocol != tt.wantProtocol {
+				t.Errorf("Protocol = %v, want %v", p.Opt.Protocol, tt.wantProtocol)
+			}
+		})
+	}
+}
+
+func TestNewPlugin_AddrDefaultHTTP(t *testing.T) {
+	cfg := baseConfig()
+	cfg["Protocol"] = "http"
 	p, err := NewPlugin(makeConfig(cfg))
 	if err != nil {
 		t.Fatalf("NewPlugin() unexpected error: %v", err)
+	}
+	// Verify default Addr for HTTP protocol.
+	if len(p.Opt.Addr) != 1 || p.Opt.Addr[0] != "localhost:8123" {
+		t.Errorf("Addr = %v, want [localhost:8123] (clickhouse-go default for http)", p.Opt.Addr)
 	}
 	if p.Opt.Protocol != clickhouse.HTTP {
 		t.Errorf("Protocol = %v, want HTTP", p.Opt.Protocol)
 	}
 }
 
+func TestNewPlugin_ExplicitAddr(t *testing.T) {
+	cfg := baseConfig()
+	cfg["Addr"] = "127.0.0.1:9000"
+	p, err := NewPlugin(makeConfig(cfg))
+	if err != nil {
+		t.Fatalf("NewPlugin() unexpected error: %v", err)
+	}
+	if len(p.Opt.Addr) != 1 || p.Opt.Addr[0] != "127.0.0.1:9000" {
+		t.Errorf("Addr = %v, want [127.0.0.1:9000]", p.Opt.Addr)
+	}
+}
+
+func TestNewPlugin_ExplicitUsername(t *testing.T) {
+	cfg := baseConfig()
+	cfg["UserName"] = "custom_user"
+	p, err := NewPlugin(makeConfig(cfg))
+	if err != nil {
+		t.Fatalf("NewPlugin() unexpected error: %v", err)
+	}
+	if p.Opt.Auth.Username != "custom_user" {
+		t.Errorf("Username = %q, want %q", p.Opt.Auth.Username, "custom_user")
+	}
+}
+
 func TestNewPlugin_MultipleAddresses(t *testing.T) {
 	cfg := baseConfig()
-	cfg["TCP"] = "host1:9000,host2:9000,host3:9000"
+	cfg["Addr"] = "host1:9000,host2:9000,host3:9000"
 
 	p, err := NewPlugin(makeConfig(cfg))
 	if err != nil {
@@ -465,22 +529,25 @@ func TestNewPlugin_SettingsResourceLimits(t *testing.T) {
 	}
 }
 
-func TestNewPlugin_Debug(t *testing.T) {
+func TestNewPlugin_LogLevel(t *testing.T) {
 	tests := []struct {
-		name    string
-		value   string
-		want    bool
-		wantErr bool
+		name       string
+		value      string
+		wantLogger bool
+		wantErr    bool
 	}{
-		{name: "true", value: "true", want: true},
-		{name: "false", value: "false", want: false},
-		{name: "invalid", value: "maybe", wantErr: true},
+		{name: "debug", value: "debug", wantLogger: true},
+		{name: "info", value: "info", wantLogger: true},
+		{name: "warn", value: "warn", wantLogger: true},
+		{name: "error", value: "error", wantLogger: true},
+		{name: "empty", value: "", wantLogger: true}, // empty now defaults to info level
+		{name: "invalid", value: "trace", wantErr: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := baseConfig()
-			cfg["Debug"] = tt.value
+			cfg["LogLevel"] = tt.value
 			p, err := NewPlugin(makeConfig(cfg))
 			if tt.wantErr {
 				if err == nil {
@@ -491,8 +558,9 @@ func TestNewPlugin_Debug(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if p.Opt.Debug != tt.want {
-				t.Errorf("Debug = %v, want %v", p.Opt.Debug, tt.want)
+			hasLogger := p.Opt.Logger != nil
+			if hasLogger != tt.wantLogger {
+				t.Errorf("Logger != nil = %v, want %v", hasLogger, tt.wantLogger)
 			}
 		})
 	}
@@ -518,53 +586,6 @@ func TestRedactSecrets_KeyValueWithColon(t *testing.T) {
 		if strings.Contains(strings.ToLower(got), secret) {
 			t.Fatalf("redactSecrets() leaked %q: %s", secret, got)
 		}
-	}
-}
-
-func TestNewPlugin_RecordTime(t *testing.T) {
-	tests := []struct {
-		name       string
-		value      string
-		wantField  string
-		wantStamp  int
-		wantFormat string
-		wantErr    bool
-	}{
-		{name: "simple field name", value: "lt", wantField: "lt"},
-		{name: "with ns", value: "lt,ns", wantField: "lt", wantStamp: 1},
-		{name: "with us", value: "lt,us", wantField: "lt", wantStamp: 2},
-		{name: "with ms", value: "lt,ms", wantField: "lt", wantStamp: 3},
-		{name: "with s", value: "lt,s", wantField: "lt", wantStamp: 4},
-		{name: "with comma layout", value: "lt,Mon, 02 Jan 2006 15:04:05 MST", wantField: "lt", wantFormat: "Mon, 02 Jan 2006 15:04:05 MST"},
-		{name: "with custom format", value: "lt,2006-01-02 15:04:05.000", wantField: "lt", wantFormat: "2006-01-02 15:04:05.000"},
-		{name: "invalid format", value: "lt,2006-13-02", wantErr: true},
-		{name: "invalid strftime format", value: "lt,%Y-%m-%d", wantErr: true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := baseConfig()
-			cfg["RecordTime"] = tt.value
-			p, err := NewPlugin(makeConfig(cfg))
-			if tt.wantErr {
-				if err == nil {
-					t.Fatal("expected error, got nil")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if p.RecordTime != tt.wantField {
-				t.Errorf("RecordTime = %q, want %q", p.RecordTime, tt.wantField)
-			}
-			if p.TimeStamp != tt.wantStamp {
-				t.Errorf("TimeStamp = %d, want %d", p.TimeStamp, tt.wantStamp)
-			}
-			if p.TimeFormat != tt.wantFormat {
-				t.Errorf("TimeFormat = %q, want %q", p.TimeFormat, tt.wantFormat)
-			}
-		})
 	}
 }
 
@@ -625,60 +646,6 @@ func TestStringifyValue_FastPathAndFallback(t *testing.T) {
 	}
 }
 
-func TestNewPlugin_Tags(t *testing.T) {
-	tests := []struct {
-		name     string
-		tags     string
-		tagSplit string
-		wantTags []string
-		wantErr  bool
-	}{
-		{
-			name:     "simple tags",
-			tags:     "ignore,server,idx|Int32",
-			wantTags: []string{"", "server", "idx"},
-		},
-		{
-			name:     "all ignore",
-			tags:     "ignore,ignore",
-			wantTags: []string{"", ""},
-		},
-		{
-			name:    "invalid type",
-			tags:    "name|Map",
-			wantErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := baseConfig()
-			cfg["Tags"] = tt.tags
-			if tt.tagSplit != "" {
-				cfg["TagSplit"] = tt.tagSplit
-			}
-			p, err := NewPlugin(makeConfig(cfg))
-			if tt.wantErr {
-				if err == nil {
-					t.Fatal("expected error, got nil")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if len(p.Tags) != len(tt.wantTags) {
-				t.Fatalf("Tags count = %d, want %d", len(p.Tags), len(tt.wantTags))
-			}
-			for i, tag := range tt.wantTags {
-				if p.Tags[i] != tag {
-					t.Errorf("Tags[%d] = %q, want %q", i, p.Tags[i], tag)
-				}
-			}
-		})
-	}
-}
-
 func TestNewPlugin_ClientInfo(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -707,6 +674,35 @@ func TestNewPlugin_ClientInfo(t *testing.T) {
 			}
 			if len(p.Opt.ClientInfo.Products) != tt.wantN {
 				t.Errorf("Products count = %d, want %d", len(p.Opt.ClientInfo.Products), tt.wantN)
+			}
+		})
+	}
+}
+
+func TestNewPlugin_ClientComment(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		wantN int
+	}{
+		{name: "single comment", value: "production", wantN: 1},
+		{name: "multiple comments", value: "production,region-us", wantN: 2},
+		{name: "empty string", value: "", wantN: 0},
+		{name: "trims whitespace", value: "  production  ,  region-us  ", wantN: 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseConfig()
+			if tt.value != "" {
+				cfg["ClientComment"] = tt.value
+			}
+			p, err := NewPlugin(makeConfig(cfg))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(p.Opt.ClientInfo.Comment) != tt.wantN {
+				t.Errorf("Comment count = %d, want %d", len(p.Opt.ClientInfo.Comment), tt.wantN)
 			}
 		})
 	}
@@ -750,31 +746,9 @@ func TestConfigError(t *testing.T) {
 	}
 }
 
-func TestResolveTimestamp(t *testing.T) {
-	p := &ClickHousePlugin{}
-	now := time.Now()
-
-	t.Run("uint64", func(t *testing.T) {
-		ts := p.resolveTimestamp(uint64(1700000000), nil)
-		expected := time.Unix(1700000000, 0)
-		if !ts.Equal(expected) {
-			t.Errorf("got %v, want %v", ts, expected)
-		}
-	})
-
-	t.Run("unknown type defaults to now", func(t *testing.T) {
-		ts := p.resolveTimestamp("not a timestamp", nil)
-		if ts.Before(now) {
-			t.Error("expected timestamp >= now for unknown type")
-		}
-	})
-}
-
 func BenchmarkNewPlugin(b *testing.B) {
 	cfg := baseConfig()
 	cfg["Compression"] = "lz4"
-	cfg["Tags"] = "ignore,server,idx|Int32"
-	cfg["RecordTime"] = "lt,ns"
 	cfg["ClientInfo"] = "myapp/1.0"
 	get := makeConfig(cfg)
 

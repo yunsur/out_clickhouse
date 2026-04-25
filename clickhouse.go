@@ -12,6 +12,7 @@ import (
 	"hash"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -37,9 +38,7 @@ import (
 
 // Sentinel errors for configuration validation.
 var (
-	ErrNoAddress  = errors.New("clickhouse: TCP or HTTP address is required")
-	ErrNoDB       = errors.New("clickhouse: DB is required")
-	ErrNoUserName = errors.New("clickhouse: UserName is required")
+	ErrNoDatabase = errors.New("clickhouse: Database is required")
 	ErrNoTable    = errors.New("clickhouse: Table is required")
 	ErrNoColumns  = errors.New("clickhouse: Columns is required")
 )
@@ -191,13 +190,6 @@ type ClickHousePlugin struct {
 	Defaults    []any
 	ColType     []ColumnParser
 	ColNullable []bool
-	RecordTime  string
-	TimeFormat  string
-	TimeStamp   int // 1:ns 2:us 3:ms 4:s
-	Tags        []string
-	TagType     []ColumnParser
-	TagDefaults []any
-	TagSplit    string
 	TableName   string
 	BatchStmt   string
 	MetricsAddr string
@@ -221,6 +213,12 @@ type ClickHousePlugin struct {
 	metricsListener net.Listener
 	logInstance     unsafe.Pointer
 	errorLog        *throttledLogger
+
+	// Logger is the unified slog logger for both plugin and clickhouse-go.
+	Logger *slog.Logger
+
+	// logLevel stores the parsed log level for level filtering.
+	logLevel slog.Level
 }
 
 // NewPlugin parses the Fluent Bit plugin configuration and returns a new ClickHousePlugin.
@@ -232,29 +230,23 @@ func NewPlugin(get func(key string, defaults ...string) string) (*ClickHousePlug
 	}
 	opt := p.Opt
 
-	if val := get("TCP"); val != "" {
-		opt.Addr = strings.Split(val, ",")
-	} else if val = get("HTTP"); val != "" {
-		opt.Addr = strings.Split(val, ",")
-		opt.Protocol = clickhouse.HTTP
-	} else {
-		return nil, ErrNoAddress
+	if err := p.parseProtocol(get, opt); err != nil {
+		return nil, err
 	}
-
-	if val := get("DB"); val != "" {
-		opt.Auth.Database = val
-	} else {
-		return nil, ErrNoDB
-	}
-	if err := validateIdentifier("DB", opt.Auth.Database); err != nil {
+	if err := p.parseAddr(get, opt); err != nil {
 		return nil, err
 	}
 
-	if val := get("UserName"); val != "" {
-		opt.Auth.Username = val
-	} else {
-		return nil, ErrNoUserName
+	opt.Auth.Database = get("Database")
+	if opt.Auth.Database == "" {
+		return nil, configErr("Database", ErrNoDatabase)
 	}
+	if err := validateIdentifier("Database", opt.Auth.Database); err != nil {
+		return nil, err
+	}
+
+	// Default to "default" username, matching clickhouse-go defaults.
+	opt.Auth.Username = get("UserName", "default")
 
 	if val := get("Password"); val != "" {
 		opt.Auth.Password = val
@@ -269,7 +261,7 @@ func NewPlugin(get func(key string, defaults ...string) string) (*ClickHousePlug
 	}
 	p.TableName = tableName
 
-	if err := p.parseDebug(get); err != nil {
+	if err := p.parseLogLevel(get); err != nil {
 		return nil, err
 	}
 	if err := p.parsePoolConfig(get, opt); err != nil {
@@ -299,18 +291,15 @@ func NewPlugin(get func(key string, defaults ...string) string) (*ClickHousePlug
 	if err := p.parseMetricsConfig(get); err != nil {
 		return nil, err
 	}
+	if err := p.parseJWT(get); err != nil {
+		return nil, err
+	}
 
 	columnsVal := get("Columns")
 	if columnsVal == "" {
 		return nil, ErrNoColumns
 	}
 	if err := parseColumns(p, columnsVal); err != nil {
-		return nil, err
-	}
-	if err := p.parseRecordTime(get); err != nil {
-		return nil, err
-	}
-	if err := p.parseTags(get); err != nil {
 		return nil, err
 	}
 
@@ -360,19 +349,43 @@ func logPluginfForInstance(instance unsafe.Pointer, level int, levelText string,
 }
 
 func (p *ClickHousePlugin) logInfof(format string, args ...any) {
-	p.logPluginf(pluginLogLevelInfo, "INFO", format, args...)
+	if p.Logger != nil {
+		if p.logLevel <= slog.LevelInfo {
+			p.Logger.Info(fmt.Sprintf(format, args...))
+		}
+	} else {
+		p.logPluginf(pluginLogLevelInfo, "INFO", format, args...)
+	}
 }
 
 func (p *ClickHousePlugin) logWarnf(format string, args ...any) {
-	p.logPluginf(pluginLogLevelWarn, "WARN", format, args...)
+	if p.Logger != nil {
+		if p.logLevel <= slog.LevelWarn {
+			p.Logger.Warn(fmt.Sprintf(format, args...))
+		}
+	} else {
+		p.logPluginf(pluginLogLevelWarn, "WARN", format, args...)
+	}
 }
 
 func (p *ClickHousePlugin) logErrorf(format string, args ...any) {
-	p.logPluginf(pluginLogLevelError, "ERROR", format, args...)
+	if p.Logger != nil {
+		if p.logLevel <= slog.LevelError {
+			p.Logger.Error(fmt.Sprintf(format, args...))
+		}
+	} else {
+		p.logPluginf(pluginLogLevelError, "ERROR", format, args...)
+	}
 }
 
 func (p *ClickHousePlugin) logDebugf(format string, args ...any) {
-	p.logPluginf(pluginLogLevelDebug, "DEBUG", format, args...)
+	if p.Logger != nil {
+		if p.logLevel <= slog.LevelDebug {
+			p.Logger.Debug(fmt.Sprintf(format, args...))
+		}
+	} else {
+		p.logPluginf(pluginLogLevelDebug, "DEBUG", format, args...)
+	}
 }
 
 func (p *ClickHousePlugin) logPluginf(level int, levelText string, format string, args ...any) {
@@ -403,23 +416,106 @@ func (p *ClickHousePlugin) releaseContextOnce() {
 	})
 }
 
-func (p *ClickHousePlugin) parseDebug(get func(string, ...string) string) error {
-	val := get("Debug")
+// fluentBitHandler implements slog.Handler to forward clickhouse-go logs to Fluent Bit.
+type fluentBitHandler struct {
+	plugin   *ClickHousePlugin
+	level    slog.Level
+	password string
+	attrs    []slog.Attr
+}
+
+func (h *fluentBitHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return level >= h.level
+}
+
+func (h *fluentBitHandler) Handle(ctx context.Context, r slog.Record) error {
+	// Build message with attributes
+	msg := r.Message
+
+	// Collect all attributes
+	attrs := make([]any, 0, len(h.attrs)*2+r.NumAttrs()*2)
+	for _, a := range h.attrs {
+		attrs = append(attrs, a.Key, a.Value.Any())
+	}
+	r.Attrs(func(a slog.Attr) bool {
+		attrs = append(attrs, a.Key, a.Value.Any())
+		return true
+	})
+
+	// Format message with attributes if present
+	if len(attrs) > 0 {
+		msg = fmt.Sprintf("%s %v", msg, attrs)
+	}
+
+	// Redact secrets
+	msg = redactSecrets(msg, h.password)
+
+	// Map slog level to Fluent Bit level
+	var level int
+	var levelText string
+	switch {
+	case r.Level >= slog.LevelError:
+		level = pluginLogLevelError
+		levelText = "ERROR"
+	case r.Level >= slog.LevelWarn:
+		level = pluginLogLevelWarn
+		levelText = "WARN"
+	case r.Level >= slog.LevelInfo:
+		level = pluginLogLevelInfo
+		levelText = "INFO"
+	default:
+		level = pluginLogLevelDebug
+		levelText = "DEBUG"
+	}
+
+	h.plugin.logPluginf(level, levelText, "%s", msg)
+	return nil
+}
+
+func (h *fluentBitHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	newAttrs := make([]slog.Attr, len(h.attrs)+len(attrs))
+	copy(newAttrs, h.attrs)
+	copy(newAttrs[len(h.attrs):], attrs)
+	return &fluentBitHandler{
+		plugin:   h.plugin,
+		level:    h.level,
+		password: h.password,
+		attrs:    newAttrs,
+	}
+}
+
+func (h *fluentBitHandler) WithGroup(name string) slog.Handler {
+	// Fluent Bit logger doesn't support groups, just return the same handler
+	return h
+}
+
+func (p *ClickHousePlugin) parseLogLevel(get func(string, ...string) string) error {
+	val := get("LogLevel")
 	if val == "" {
-		return nil
-	}
-	ok, err := strconv.ParseBool(val)
-	if err != nil {
-		return configErr("Debug", err)
-	}
-	p.Opt.Debug = ok
-	if ok {
-		password := p.Opt.Auth.Password
-		p.Opt.Debugf = func(format string, args ...any) {
-			msg := fmt.Sprintf(format, args...)
-			p.logDebugf("[clickhouse-debug] %s", redactSecrets(msg, password))
+		p.logLevel = slog.LevelInfo // default
+	} else {
+		switch strings.ToLower(strings.TrimSpace(val)) {
+		case "debug":
+			p.logLevel = slog.LevelDebug
+		case "info":
+			p.logLevel = slog.LevelInfo
+		case "warn":
+			p.logLevel = slog.LevelWarn
+		case "error":
+			p.logLevel = slog.LevelError
+		default:
+			return configErr("LogLevel", fmt.Errorf("unsupported value %q, want: debug, info, warn, error", val))
 		}
 	}
+
+	password := p.Opt.Auth.Password
+	handler := &fluentBitHandler{
+		plugin:   p,
+		level:    p.logLevel,
+		password: password,
+	}
+	p.Logger = slog.New(handler)
+	p.Opt.Logger = p.Logger
 	return nil
 }
 
@@ -463,7 +559,7 @@ func (p *ClickHousePlugin) parsePoolConfig(get func(string, ...string) string, o
 	}
 	opt.ConnMaxLifetime = dv
 
-	cfg = get("ReadTimeout", "5m")
+	cfg = get("ReadTimeout", "300s")
 	dv, err = time.ParseDuration(cfg)
 	if err != nil {
 		return configErr("ReadTimeout", err)
@@ -484,6 +580,42 @@ func (p *ClickHousePlugin) parsePoolConfig(get func(string, ...string) string, o
 	}
 	p.SemaphoreTimeout = dv
 
+	cfg = get("FreeBufOnConnRelease", "false")
+	bv, err := strconv.ParseBool(cfg)
+	if err != nil {
+		return configErr("FreeBufOnConnRelease", err)
+	}
+	opt.FreeBufOnConnRelease = bv
+
+	return nil
+}
+
+func (p *ClickHousePlugin) parseProtocol(get func(string, ...string) string, opt *clickhouse.Options) error {
+	cfg := strings.TrimSpace(get("Protocol"))
+	switch cfg {
+	case "", "native":
+		opt.Protocol = clickhouse.Native
+	case "http":
+		opt.Protocol = clickhouse.HTTP
+	default:
+		return configErr("Protocol", fmt.Errorf("unsupported value %q, want: native, http", cfg))
+	}
+	return nil
+}
+
+func (p *ClickHousePlugin) parseAddr(get func(string, ...string) string, opt *clickhouse.Options) error {
+	cfg := strings.TrimSpace(get("Addr"))
+	if cfg != "" {
+		opt.Addr = strings.Split(cfg, ",")
+		return nil
+	}
+	// Default address based on protocol, matching clickhouse-go setDefaults.
+	switch opt.Protocol {
+	case clickhouse.HTTP:
+		opt.Addr = []string{"localhost:8123"}
+	default:
+		opt.Addr = []string{"localhost:9000"}
+	}
 	return nil
 }
 
@@ -554,21 +686,29 @@ func (p *ClickHousePlugin) parseBufferConfig(get func(string, ...string) string,
 
 func (p *ClickHousePlugin) parseClientInfo(get func(string, ...string) string, opt *clickhouse.Options) error {
 	cfg := get("ClientInfo")
-	if cfg == "" {
-		return nil
-	}
-	for _, v := range strings.Split(cfg, ",") {
-		infos := strings.Split(strings.TrimSpace(v), "/")
-		if len(infos) != 2 {
-			return configErr("ClientInfo", fmt.Errorf("value %q must be in name/version format", v))
+	if cfg != "" {
+		for _, v := range strings.Split(cfg, ",") {
+			infos := strings.Split(strings.TrimSpace(v), "/")
+			if len(infos) != 2 {
+				return configErr("ClientInfo", fmt.Errorf("value %q must be in name/version format", v))
+			}
+			opt.ClientInfo.Products = append(opt.ClientInfo.Products, struct {
+				Name    string
+				Version string
+			}{
+				Name:    strings.TrimSpace(infos[0]),
+				Version: strings.TrimSpace(infos[1]),
+			})
 		}
-		opt.ClientInfo.Products = append(opt.ClientInfo.Products, struct {
-			Name    string
-			Version string
-		}{
-			Name:    strings.TrimSpace(infos[0]),
-			Version: strings.TrimSpace(infos[1]),
-		})
+	}
+
+	cfg = get("ClientComment")
+	if cfg != "" {
+		for _, v := range strings.Split(cfg, ",") {
+			if comment := strings.TrimSpace(v); comment != "" {
+				opt.ClientInfo.Comment = append(opt.ClientInfo.Comment, comment)
+			}
+		}
 	}
 	return nil
 }
@@ -705,6 +845,17 @@ func (p *ClickHousePlugin) parseMetricsConfig(get func(string, ...string) string
 	return nil
 }
 
+func (p *ClickHousePlugin) parseJWT(get func(string, ...string) string) error {
+	jwt := strings.TrimSpace(get("JWT"))
+	if jwt == "" {
+		return nil
+	}
+	p.Opt.GetJWT = func(ctx context.Context) (string, error) {
+		return jwt, nil
+	}
+	return nil
+}
+
 func parseKeyValueConfig(cfg string) (map[string]string, error) {
 	result := make(map[string]string)
 	for _, item := range strings.Split(cfg, ",") {
@@ -768,70 +919,6 @@ func parseSettingValue(raw string) any {
 		return f
 	}
 	return raw
-}
-
-func (p *ClickHousePlugin) parseRecordTime(get func(string, ...string) string) error {
-	cfg := strings.TrimSpace(get("RecordTime"))
-	if cfg == "" {
-		return nil
-	}
-	arr := strings.SplitN(cfg, ",", 2)
-	if len(arr) == 1 {
-		p.RecordTime = strings.TrimSpace(cfg)
-		return nil
-	}
-
-	p.RecordTime = strings.TrimSpace(arr[0])
-	format := strings.TrimSpace(arr[1])
-	switch format {
-	case "ns":
-		p.TimeStamp = 1
-	case "us":
-		p.TimeStamp = 2
-	case "ms":
-		p.TimeStamp = 3
-	case "s":
-		p.TimeStamp = 4
-	default:
-		if strings.Contains(format, "%") {
-			return configErr("RecordTime", fmt.Errorf("invalid time format: contains strftime tokens"))
-		}
-		if _, err := time.Parse(format, time.Now().Format(format)); err != nil {
-			return configErr("RecordTime", fmt.Errorf("invalid time format: %w", err))
-		}
-		p.TimeFormat = format
-	}
-	return nil
-}
-
-func (p *ClickHousePlugin) parseTags(get func(string, ...string) string) error {
-	cfg := get("Tags")
-	if cfg == "" {
-		return nil
-	}
-	split := get("TagSplit", ".")
-	p.TagSplit = split
-	for _, v := range strings.Split(cfg, ",") {
-		v = strings.TrimSpace(v)
-		if v == "ignore" {
-			v = ""
-		}
-		if strings.Contains(v, "|") {
-			typInfo := strings.Split(v, "|")
-			v = typInfo[0]
-			parser, def, err := parseColumnType(typInfo[1:])
-			if err != nil {
-				return configErr("Tags", fmt.Errorf("parse type for %q failed: %w", v, err))
-			}
-			p.TagType = append(p.TagType, parser)
-			p.TagDefaults = append(p.TagDefaults, def)
-		} else {
-			p.TagType = append(p.TagType, parseString)
-			p.TagDefaults = append(p.TagDefaults, "")
-		}
-		p.Tags = append(p.Tags, v)
-	}
-	return nil
 }
 
 // Init opens the ClickHouse connection and prepares the batch insert statement.
@@ -943,7 +1030,6 @@ func (p *ClickHousePlugin) batchInsertWithNext(tag string, next func() (any, map
 	baseCtx := p.rootCtx
 	writeTimeout := p.WriteTimeout
 	semTimeout := p.SemaphoreTimeout
-	debugEnabled := p.Opt != nil && p.Opt.Debug
 	p.mu.RUnlock()
 	defer p.inflight.Done()
 	defer func() {
@@ -982,36 +1068,14 @@ func (p *ClickHousePlugin) batchInsertWithNext(tag string, next func() (any, map
 	ctx, cancel := context.WithTimeout(baseCtx, writeTimeout)
 	defer cancel()
 
-	var tagValues []any
-	if len(p.Tags) > 0 {
-		values := strings.SplitN(tag, p.TagSplit, len(p.Tags))
-		for i, t := range p.Tags {
-			if t == "" {
-				continue
-			}
-			if i >= len(values) {
-				tagValues = append(tagValues, resolveDefaultValue(p.TagDefaults[i]))
-				continue
-			}
-			val, err := p.TagType[i](values[i])
-			if err != nil {
-				p.throttledErrorf("tag_parse", "tag parse failed: tag_key=%s", t)
-				if debugEnabled {
-					p.throttledErrorf("tag_parse_debug", "tag parse failed (debug): tag_key=%s err=%v", t, err)
-				}
-				return output.FLB_ERROR
-			}
-			tagValues = append(tagValues, val)
-		}
-	}
-	code, records = p.insertBatch(ctx, conn, tagValues, next, debugEnabled, metrics)
+	code, records = p.insertBatch(ctx, conn, next, metrics)
 	return code
 }
 
-func (p *ClickHousePlugin) insertBatch(ctx context.Context, conn Connector, tagValues []any, next func() (any, map[interface{}]interface{}, bool, int), debugEnabled bool, metrics *pluginMetrics) (int, int) {
+func (p *ClickHousePlugin) insertBatch(ctx context.Context, conn Connector, next func() (any, map[interface{}]interface{}, bool, int), metrics *pluginMetrics) (int, int) {
 	totalRows := 0
 	for {
-		pendingRows, dedupToken, eof, code, decodeDroppedRows := p.decodeRowsChunk(tagValues, next, debugEnabled)
+		pendingRows, dedupToken, eof, code, decodeDroppedRows := p.decodeRowsChunk(next)
 		if decodeDroppedRows > 0 {
 			observeDroppedRows(metrics, output.FLB_ERROR, "parse", decodeDroppedRows)
 		}
@@ -1069,12 +1133,12 @@ func (p *ClickHousePlugin) sendRows(ctx context.Context, conn Connector, dedupTo
 	return output.FLB_OK
 }
 
-func (p *ClickHousePlugin) decodeRowsChunk(tagValues []any, next func() (any, map[interface{}]interface{}, bool, int), debugEnabled bool) ([][]any, string, bool, int, int) {
+func (p *ClickHousePlugin) decodeRowsChunk(next func() (any, map[interface{}]interface{}, bool, int)) ([][]any, string, bool, int, int) {
 	pendingRows := make([][]any, 0, 32)
 	hasher := xxhash.New()
 	droppedRows := 0
 	for len(pendingRows) < maxRowsPerChunk {
-		ts, record, eof, code := next()
+		_, record, eof, code := next()
 		if eof {
 			if len(pendingRows) == 0 {
 				return nil, "", true, output.FLB_OK, droppedRows
@@ -1087,19 +1151,10 @@ func (p *ClickHousePlugin) decodeRowsChunk(tagValues []any, next func() (any, ma
 		}
 		normalized := normalizeRecord(record)
 
-		columns := make([]any, 0, len(p.Columns)+len(tagValues)+1)
-		if p.RecordTime != "" {
-			columns = append(columns, p.resolveTimestamp(ts, normalized))
-		}
-		if len(tagValues) > 0 {
-			columns = append(columns, tagValues...)
-		}
+		columns := make([]any, 0, len(p.Columns))
 
 		skipRow := false
 		for idx, colName := range p.Columns {
-			if p.shouldSkipColumn(colName) {
-				continue
-			}
 
 			value, ok := normalized[colName]
 			if !ok {
@@ -1114,7 +1169,7 @@ func (p *ClickHousePlugin) decodeRowsChunk(tagValues []any, next func() (any, ma
 			val, err := coerceColumnValue(p.ColType[idx], value)
 			if err != nil {
 				p.throttledErrorf("column_parse", "column parse failed: column=%s type=%T, skipping record", colName, value)
-				if debugEnabled {
+				if p.logLevel <= slog.LevelDebug {
 					p.throttledErrorf("column_parse_debug", "column parse failed (debug): column=%s err=%v", colName, err)
 				}
 				skipRow = true
@@ -1186,91 +1241,12 @@ func extractTimestamp(raw any) (any, bool) {
 	}
 }
 
-// resolveTimestamp converts a Fluent Bit timestamp to time.Time.
-func (p *ClickHousePlugin) resolveTimestamp(ts any, record map[string]any) time.Time {
-	if p.RecordTime != "" {
-		if raw, ok := record[p.RecordTime]; ok {
-			if parsed, ok := p.parseRecordTimeValue(raw); ok {
-				return parsed
-			}
-		}
-	}
-
-	switch t := ts.(type) {
-	case output.FLBTime:
-		return t.Time
-	case uint64:
-		return time.Unix(int64(t), 0)
-	default:
-		p.logWarnf("unknown timestamp type %T, defaulting to now", ts)
-		return time.Now()
-	}
-}
-
-func (p *ClickHousePlugin) parseRecordTimeValue(raw any) (time.Time, bool) {
-	if p.TimeStamp == 0 && p.TimeFormat == "" {
-		return time.Time{}, false
-	}
-
-	value := stringifyValue(raw)
-	switch p.TimeStamp {
-	case 1:
-		n, err := strconv.ParseInt(value, 10, 64)
-		if err != nil {
-			return time.Time{}, false
-		}
-		return time.Unix(0, n), true
-	case 2:
-		n, err := strconv.ParseInt(value, 10, 64)
-		if err != nil {
-			return time.Time{}, false
-		}
-		return time.Unix(0, n*int64(time.Microsecond)), true
-	case 3:
-		n, err := strconv.ParseInt(value, 10, 64)
-		if err != nil {
-			return time.Time{}, false
-		}
-		return time.UnixMilli(n), true
-	case 4:
-		n, err := strconv.ParseInt(value, 10, 64)
-		if err != nil {
-			return time.Time{}, false
-		}
-		return time.Unix(n, 0), true
-	}
-
-	if p.TimeFormat == "" {
-		return time.Time{}, false
-	}
-	parsed, err := time.Parse(p.TimeFormat, value)
-	if err != nil {
-		return time.Time{}, false
-	}
-	return parsed, true
-}
-
 func (p *ClickHousePlugin) insertColumns() []string {
-	columns := make([]string, 0, len(p.Columns)+1+len(p.Tags))
-	if p.RecordTime != "" {
-		columns = append(columns, p.RecordTime)
-	}
-	for _, v := range p.Tags {
-		if v != "" {
-			columns = append(columns, v)
-		}
-	}
+	columns := make([]string, 0, len(p.Columns))
 	for _, v := range p.Columns {
-		if p.shouldSkipColumn(v) {
-			continue
-		}
 		columns = append(columns, v)
 	}
 	return columns
-}
-
-func (p *ClickHousePlugin) shouldSkipColumn(name string) bool {
-	return p.RecordTime != "" && name == p.RecordTime
 }
 
 func (p *ClickHousePlugin) tableRef() string {
