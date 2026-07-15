@@ -74,11 +74,15 @@ var protectedSettings = map[string]struct{}{
 	"insert_deduplicate":         {},
 }
 
+// retryableCHCodes maps ClickHouse exception codes that are safe to retry.
+// Excluded codes that would compound resource exhaustion:
+//   210 (NETWORK_ERROR)     — connection pool full, retry makes it worse
+//   236 (ABORTED)           — overload protection, retry re-triggers
+//   439 (CANNOT_SCHEDULE_TASK) — thread pool exhausted, retry compounds
+//   1000 (POCO_EXCEPTION)   — no thread available, same reason
 var retryableCHCodes = map[int32]struct{}{
 	203: {},
 	209: {},
-	210: {},
-	236: {},
 	241: {},
 	242: {},
 	252: {},
@@ -531,14 +535,14 @@ func redactSecrets(input string, password string) string {
 }
 
 func (p *ClickHousePlugin) parsePoolConfig(get func(string, ...string) string, opt *clickhouse.Options) error {
-	cfg := get("MaxIdleConns", "5")
+	cfg := get("MaxIdleConns", "1")
 	nv, err := strconv.Atoi(cfg)
 	if err != nil {
 		return configErr("MaxIdleConns", err)
 	}
 	opt.MaxIdleConns = nv
 
-	cfg = get("MaxOpenConns", strconv.Itoa(opt.MaxIdleConns+5))
+	cfg = get("MaxOpenConns", strconv.Itoa(opt.MaxIdleConns+2))
 	nv, err = strconv.Atoi(cfg)
 	if err != nil {
 		return configErr("MaxOpenConns", err)
@@ -1398,7 +1402,7 @@ func classifyInsertError(err error) int {
 		return output.FLB_RETRY
 	}
 	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
-		return output.FLB_RETRY
+		return output.FLB_ERROR
 	}
 
 	var netErr net.Error

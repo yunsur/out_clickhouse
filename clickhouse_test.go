@@ -344,11 +344,11 @@ func TestNewPlugin_DefaultOptionsSync(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if p.Opt.MaxIdleConns != 5 {
-		t.Errorf("MaxIdleConns = %d, want 5", p.Opt.MaxIdleConns)
+	if p.Opt.MaxIdleConns != 1 {
+		t.Errorf("MaxIdleConns = %d, want 1", p.Opt.MaxIdleConns)
 	}
-	if p.Opt.MaxOpenConns != 10 {
-		t.Errorf("MaxOpenConns = %d, want 10", p.Opt.MaxOpenConns)
+	if p.Opt.MaxOpenConns != 3 {
+		t.Errorf("MaxOpenConns = %d, want 3", p.Opt.MaxOpenConns)
 	}
 	if p.Opt.DialTimeout != 30*time.Second {
 		t.Errorf("DialTimeout = %v, want 30s", p.Opt.DialTimeout)
@@ -378,8 +378,8 @@ func TestNewPlugin_MaxOpenConnsDefaultDerivedFromIdle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if p.Opt.MaxOpenConns != 12 {
-		t.Errorf("MaxOpenConns = %d, want 12", p.Opt.MaxOpenConns)
+	if p.Opt.MaxOpenConns != 9 {
+		t.Errorf("MaxOpenConns = %d, want 9", p.Opt.MaxOpenConns)
 	}
 }
 

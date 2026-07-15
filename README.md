@@ -32,8 +32,8 @@ Fluent Bit output plugin for writing logs to ClickHouse via native TCP or HTTP.
 | Table | string | - | Yes | Target table name. | `events` |
 | Columns | string | - | Yes | Record-to-column mapping list, format: `name|type[|layout]`. | `uid|Int64,event|String,time|DateTime64|2006-01-02T15:04:05.000+08:00` |
 | LogLevel | enum | `info` | No | Log level for plugin and clickhouse-go: `debug`, `info`, `warn`, `error`. | `debug` |
-| MaxIdleConns | int | `5` | No | Max idle connections. | `10` |
-| MaxOpenConns | int | `MaxIdleConns+5` | No | Max open connections. | `20` |
+| MaxIdleConns | int | `1` | No | Max idle connections. | `10` |
+| MaxOpenConns | int | `MaxIdleConns+2` | No | Max open connections. | `20` |
 | DialTimeout | duration | `30s` | No | Dial timeout and ping timeout baseline. | `10s` |
 | ReadTimeout | duration | `300s` | No | Read timeout for requests. | `1m` |
 | WriteTimeout | duration | `ReadTimeout` | No | End-to-end deadline for one flush (prepare + append + send). | `2m` |
