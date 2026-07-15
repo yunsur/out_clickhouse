@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
+	"log/slog"
 	"net"
 	"reflect"
 	"strings"
@@ -2392,5 +2394,108 @@ func assertTypedValue[T comparable](t *testing.T, got any, want T) {
 	}
 	if typed != want {
 		t.Fatalf("value = %v (%T), want %v (%T)", got, got, want, want)
+	}
+}
+
+func TestBatchBuffer_EmptyFlush(t *testing.T) {
+	buf := &batchBuffer{
+		maxRows:  5000,
+		interval: time.Second,
+		notify:   make(chan struct{}, 1),
+		stop:     make(chan struct{}),
+		p: &ClickHousePlugin{
+			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		},
+	}
+	// flush with no rows should not panic
+	buf.flush()
+}
+
+func TestBatchBuffer_AppendAndFlush(t *testing.T) {
+	batch := &mockBatch{}
+	conn := &mockConn{batch: batch}
+	p := &ClickHousePlugin{
+		Opt:         &clickhouse.Options{Auth: clickhouse.Auth{Database: "default"}},
+		Columns:     []string{"message"},
+		Defaults:    []any{""},
+		ColType:     []ColumnParser{parseString},
+		TableName:   "events",
+		BatchStmt:   "INSERT INTO default.events(message)",
+		Conn:        conn,
+		WriteTimeout: time.Second,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		metricsLabels: prometheus.Labels{
+			"table":    "events",
+			"database": "default",
+		},
+	}
+
+	buf := newBatchBuffer(p, 10, 100*time.Millisecond)
+
+	// Append rows in batches
+	buf.Append([][]any{{"hello"}, {"world"}})
+	buf.Append([][]any{{"foo"}, {"bar"}})
+
+	if len(buf.rows) != 4 {
+		t.Fatalf("buffer rows = %d, want 4", len(buf.rows))
+	}
+
+	// Flush
+	buf.flush()
+
+}
+
+func TestBatchBuffer_MaxRowsTriggersFlush(t *testing.T) {
+	batch := &mockBatch{}
+	conn := &mockConn{batch: batch}
+	p := &ClickHousePlugin{
+		Opt:          &clickhouse.Options{Auth: clickhouse.Auth{Database: "default"}},
+		Columns:      []string{"message"},
+		Defaults:     []any{""},
+		ColType:      []ColumnParser{parseString},
+		TableName:    "events",
+		BatchStmt:    "INSERT INTO default.events(message)",
+		Conn:         conn,
+		WriteTimeout: time.Second,
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		metricsLabels: prometheus.Labels{
+			"table":    "events",
+			"database": "default",
+		},
+	}
+
+	buf := newBatchBuffer(p, 3, time.Hour) // long interval, won't trigger
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go buf.run(ctx)
+
+	// Append 2 rows - buffer accumulates
+	buf.Append([][]any{{"a"}, {"b"}})
+	time.Sleep(50 * time.Millisecond)
+
+	if conn.prepareCalls != 0 {
+		t.Errorf("prepareCalls = %d, want 0 before maxRows", conn.prepareCalls)
+	}
+
+	// Third row should trigger flush via notify channel
+	buf.Append([][]any{{"c"}})
+	time.Sleep(50 * time.Millisecond)
+
+	// After flush, buffer should be empty and batch should have 3 rows
+	if len(buf.rows) != 0 {
+		t.Errorf("buffer rows after flush = %d, want 0", len(buf.rows))
+	}
+	if len(batch.rows) != 3 {
+		t.Errorf("batch rows = %d, want 3", len(batch.rows))
+	}
+	if conn.prepareCalls != 1 {
+		t.Errorf("prepareCalls = %d, want 1", conn.prepareCalls)
+	}
+
+	// Fourth row goes to new buffer
+	buf.Append([][]any{{"d"}})
+	time.Sleep(50 * time.Millisecond)
+	if len(buf.rows) != 1 {
+		t.Errorf("buffer rows after 4th append = %d, want 1", len(buf.rows))
 	}
 }

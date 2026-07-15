@@ -32,8 +32,8 @@ Fluent Bit output plugin for writing logs to ClickHouse via native TCP or HTTP.
 | Table | string | - | Yes | Target table name. | `events` |
 | Columns | string | - | Yes | Record-to-column mapping list, format: `name|type[|layout]`. | `uid|Int64,event|String,time|DateTime64|2006-01-02T15:04:05.000+08:00` |
 | LogLevel | enum | `info` | No | Log level for plugin and clickhouse-go: `debug`, `info`, `warn`, `error`. | `debug` |
-| MaxIdleConns | int | `1` | No | Max idle connections. | `10` |
-| MaxOpenConns | int | `MaxIdleConns+2` | No | Max open connections. | `20` |
+| MaxIdleConns | int | `5` | No | Max idle connections. | `10` |
+| MaxOpenConns | int | `5` | No | Max open connections. | `20` |
 | DialTimeout | duration | `30s` | No | Dial timeout and ping timeout baseline. | `10s` |
 | ReadTimeout | duration | `300s` | No | Read timeout for requests. | `1m` |
 | WriteTimeout | duration | `ReadTimeout` | No | End-to-end deadline for one flush (prepare + append + send). | `2m` |
@@ -58,6 +58,9 @@ Fluent Bit output plugin for writing logs to ClickHouse via native TCP or HTTP.
 | TLSKey | string | - | No | Client key file path. Must be used with `TLSCert`. | `/etc/ssl/private/client.key` |
 | TLSInsecureSkipVerify | bool | `false` | No | Skip TLS certificate verification. | `false` |
 | MetricsAddr | string | - | No | Expose Prometheus metrics on `http://<MetricsAddr>/metrics`. | `127.0.0.1:9090` |
+| BatchEnabled | bool | `true` | No | Enable async batch buffer for higher throughput. | `true` |
+| BatchMaxRows | int | `20000` | No | Max rows in buffer before flush (max 50000). | `10000` |
+| BatchInterval | duration | `2s` | No | Max time data stays in buffer before flush. | `1s` |
 
 ## 连接与认证
 

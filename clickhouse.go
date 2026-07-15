@@ -223,6 +223,12 @@ type ClickHousePlugin struct {
 	contextRelease     func()
 	contextReleaseOnce sync.Once
 
+	// Batch buffer for async flush.
+	batchEnabled  bool
+	batchMaxRows  int
+	batchInterval time.Duration
+	buf           *batchBuffer
+
 	metricsLabels prometheus.Labels
 	logInstance   unsafe.Pointer
 	errorLog      *throttledLogger
@@ -544,14 +550,14 @@ func redactSecrets(input string, password string) string {
 }
 
 func (p *ClickHousePlugin) parsePoolConfig(get func(string, ...string) string, opt *clickhouse.Options) error {
-	cfg := get("MaxIdleConns", "1")
+	cfg := get("MaxIdleConns", "5")
 	nv, err := strconv.Atoi(cfg)
 	if err != nil {
 		return configErr("MaxIdleConns", err)
 	}
 	opt.MaxIdleConns = nv
 
-	cfg = get("MaxOpenConns", strconv.Itoa(opt.MaxIdleConns+2))
+	cfg = get("MaxOpenConns", "5")
 	nv, err = strconv.Atoi(cfg)
 	if err != nil {
 		return configErr("MaxOpenConns", err)
@@ -694,8 +700,156 @@ func (p *ClickHousePlugin) parseBufferConfig(get func(string, ...string) string,
 	}
 	opt.MaxCompressionBuffer = nv
 
+	// Batch buffer config.
+	p.batchEnabled = strings.EqualFold(get("BatchEnabled", "true"), "true")
+	cfg = get("BatchMaxRows", "20000")
+	bmr, err := strconv.Atoi(cfg)
+	if err != nil {
+		return configErr("BatchMaxRows", err)
+	}
+	if bmr < 1 {
+		return configErr("BatchMaxRows", fmt.Errorf("must be >= 1, got %d", bmr))
+	}
+	if bmr > 50000 {
+		bmr = 50000
+	}
+	p.batchMaxRows = bmr
+	cfg = get("BatchInterval", "2s")
+	p.batchInterval, err = time.ParseDuration(cfg)
+	if err != nil {
+		return configErr("BatchInterval", err)
+	}
+	if p.batchInterval <= 0 {
+		return configErr("BatchInterval", fmt.Errorf("must be positive, got %v", p.batchInterval))
+	}
+
 	return nil
 }
+
+// batchBuffer accumulates decoded rows and flushes them asynchronously.
+type batchBuffer struct {
+	mu       sync.Mutex
+	rows     [][]any
+	maxRows  int
+	interval time.Duration
+	notify   chan struct{}
+	stop     chan struct{}
+	ticker   *time.Ticker
+	p        *ClickHousePlugin
+}
+
+func newBatchBuffer(p *ClickHousePlugin, maxRows int, interval time.Duration) *batchBuffer {
+	return &batchBuffer{
+		maxRows:  maxRows,
+		interval: interval,
+		notify:   make(chan struct{}, 1),
+		stop:     make(chan struct{}),
+		ticker:   time.NewTicker(interval),
+		p:        p,
+	}
+}
+
+func (b *batchBuffer) Append(rows [][]any) {
+	b.mu.Lock()
+	b.rows = append(b.rows, rows...)
+	shouldFlush := len(b.rows) >= b.maxRows
+	b.mu.Unlock()
+	if shouldFlush {
+		select {
+		case b.notify <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (b *batchBuffer) flush() {
+	b.mu.Lock()
+	if len(b.rows) == 0 {
+		b.mu.Unlock()
+		return
+	}
+	rows := b.rows
+	b.rows = nil
+	b.mu.Unlock()
+
+	p := b.p
+	p.mu.RLock()
+	conn := p.Conn
+	writeTimeout := p.WriteTimeout
+	metrics := sharedMetrics
+	p.mu.RUnlock()
+
+	if conn == nil {
+		return
+	}
+	if writeTimeout <= 0 {
+		writeTimeout = 5 * time.Minute
+	}
+
+	// Build dedup token from all rows.
+	hasher := xxhash.New()
+	for _, row := range rows {
+		addDedupRow(hasher, row)
+	}
+	token := dedupToken(hasher)
+
+	ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
+	defer cancel()
+
+	prepareCtx := clickhouse.Context(ctx, clickhouse.WithSettings(clickhouse.Settings{
+		"insert_deduplication_token": token,
+	}))
+	batch, err := conn.PrepareBatch(prepareCtx, p.BatchStmt)
+	if err != nil {
+		p.throttledErrorf("batch_buffer", "prepare batch failed: table=%s rows=%d err=%v", p.tableRef(), len(rows), err)
+		p.observeDroppedRows(classifyInsertError(err), "buffer_send", len(rows))
+		return
+	}
+
+	for _, row := range rows {
+		if err := batch.Append(row...); err != nil {
+			_ = batch.Close()
+			p.throttledErrorf("batch_buffer", "append failed: table=%s err=%v", p.tableRef(), err)
+		p.observeDroppedRows(classifyInsertError(err), "buffer_append", len(rows))
+			return
+		}
+	}
+
+	if err := batch.Send(); err != nil {
+		p.throttledErrorf("batch_buffer", "send failed: table=%s rows=%d err=%v", p.tableRef(), len(rows), err)
+		p.observeDroppedRows(classifyInsertError(err), "buffer_send", len(rows))
+		return
+	}
+
+	if metrics != nil {
+		metrics.recordsTotal.WithLabelValues(p.metricsLabels["table"], p.metricsLabels["database"]).Add(float64(len(rows)))
+		metrics.batchRows.WithLabelValues(p.metricsLabels["table"], p.metricsLabels["database"]).Observe(float64(len(rows)))
+		metrics.flushTotal.WithLabelValues("ok", p.metricsLabels["table"], p.metricsLabels["database"]).Inc()
+	}
+	p.logDebugf("buffer flush: rows=%d table=%s", len(rows), p.TableName)
+}
+
+func (b *batchBuffer) run(ctx context.Context) {
+	defer b.ticker.Stop()
+	for {
+		select {
+		case <-b.ticker.C:
+			b.flush()
+		case <-b.notify:
+			b.flush()
+		case <-b.stop:
+			b.flush()
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (b *batchBuffer) close() {
+	close(b.stop)
+}
+
 
 func (p *ClickHousePlugin) parseClientInfo(get func(string, ...string) string, opt *clickhouse.Options) error {
 	cfg := get("ClientInfo")
@@ -988,6 +1142,10 @@ func (p *ClickHousePlugin) Init() (err error) {
 	if err = p.initMetrics(); err != nil {
 		return fmt.Errorf("clickhouse: init metrics: %w", err)
 	}
+	if p.batchEnabled {
+		p.buf = newBatchBuffer(p, p.batchMaxRows, p.batchInterval)
+		go p.buf.run(p.rootCtx)
+	}
 	return nil
 }
 
@@ -1059,6 +1217,13 @@ func (p *ClickHousePlugin) batchInsertWithNext(tag string, next func() (any, map
 		p.logErrorf("batch insert rejected: plugin is closed")
 		return output.FLB_ERROR
 	}
+	if p.buf != nil {
+		// Buffered mode: decode rows and buffer, return FLB_OK immediately.
+		p.batchInsertBuffered(next)
+		code = output.FLB_OK
+		return code
+	}
+
 	if sem != nil {
 		if semTimeout <= 0 {
 			semTimeout = 500 * time.Millisecond
@@ -1107,6 +1272,27 @@ func (p *ClickHousePlugin) insertBatch(ctx context.Context, conn Connector, next
 		}
 		if eof {
 			return output.FLB_OK, totalRows
+		}
+	}
+}
+
+// batchInsertBuffered decodes rows and appends them to the batch buffer.
+// Returns immediately without writing to ClickHouse.
+func (p *ClickHousePlugin) batchInsertBuffered(next func() (any, map[interface{}]interface{}, bool, int)) {
+	for {
+		pendingRows, _, eof, code, decodeDroppedRows := p.decodeRowsChunk(next)
+		if decodeDroppedRows > 0 {
+			p.observeDroppedRows(output.FLB_ERROR, "parse", decodeDroppedRows)
+		}
+		if code != output.FLB_OK {
+			p.observeDroppedRows(code, "decode", len(pendingRows))
+			return
+		}
+		if len(pendingRows) > 0 {
+			p.buf.Append(pendingRows)
+		}
+		if eof {
+			return
 		}
 	}
 }
@@ -1619,6 +1805,11 @@ func (p *ClickHousePlugin) Exit() {
 	if rootCancel != nil {
 		rootCancel()
 	}
+	if p.buf != nil {
+		p.buf.close()
+		p.buf.flush()
+	}
+
 
 	waitDone := make(chan struct{})
 	go func() {

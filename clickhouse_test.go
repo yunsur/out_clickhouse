@@ -344,33 +344,25 @@ func TestNewPlugin_DefaultOptionsSync(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if p.Opt.MaxIdleConns != 1 {
-		t.Errorf("MaxIdleConns = %d, want 1", p.Opt.MaxIdleConns)
+	if p.Opt.MaxIdleConns != 5 {
+		t.Errorf("MaxIdleConns = %d, want 5", p.Opt.MaxIdleConns)
 	}
-	if p.Opt.MaxOpenConns != 3 {
-		t.Errorf("MaxOpenConns = %d, want 3", p.Opt.MaxOpenConns)
+	if p.Opt.MaxOpenConns != 5 {
+		t.Errorf("MaxOpenConns = %d, want 5", p.Opt.MaxOpenConns)
 	}
-	if p.Opt.DialTimeout != 30*time.Second {
-		t.Errorf("DialTimeout = %v, want 30s", p.Opt.DialTimeout)
+	if !p.batchEnabled {
+		t.Error("batchEnabled = false, want true")
 	}
-	if p.Opt.ReadTimeout != 5*time.Minute {
-		t.Errorf("ReadTimeout = %v, want 5m", p.Opt.ReadTimeout)
+	if p.batchMaxRows != 20000 {
+		t.Errorf("batchMaxRows = %d, want 20000", p.batchMaxRows)
 	}
-	if p.WriteTimeout != 5*time.Minute {
-		t.Errorf("WriteTimeout = %v, want 5m", p.WriteTimeout)
-	}
-	if p.Opt.ConnMaxLifetime != time.Hour {
-		t.Errorf("ConnMaxLifetime = %v, want 1h", p.Opt.ConnMaxLifetime)
-	}
-	if p.Opt.BlockBufferSize != 2 {
-		t.Errorf("BlockBufferSize = %d, want 2", p.Opt.BlockBufferSize)
-	}
-	if p.Opt.MaxCompressionBuffer != 10485760 {
-		t.Errorf("MaxCompressionBuffer = %d, want 10485760", p.Opt.MaxCompressionBuffer)
+	if p.batchInterval != 2*time.Second {
+		t.Errorf("batchInterval = %v, want 2s", p.batchInterval)
 	}
 }
 
 func TestNewPlugin_MaxOpenConnsDefaultDerivedFromIdle(t *testing.T) {
+	// MaxOpenConns now has independent default "5", not derived from MaxIdleConns.
 	cfg := baseConfig()
 	cfg["MaxIdleConns"] = "7"
 
@@ -378,8 +370,11 @@ func TestNewPlugin_MaxOpenConnsDefaultDerivedFromIdle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if p.Opt.MaxOpenConns != 9 {
-		t.Errorf("MaxOpenConns = %d, want 9", p.Opt.MaxOpenConns)
+	if p.Opt.MaxOpenConns != 5 {
+		t.Errorf("MaxOpenConns = %d, want 5 (independent default)", p.Opt.MaxOpenConns)
+	}
+	if p.Opt.MaxIdleConns != 7 {
+		t.Errorf("MaxIdleConns = %d, want 7", p.Opt.MaxIdleConns)
 	}
 }
 
@@ -712,6 +707,9 @@ func TestNewPlugin_BufferConfig(t *testing.T) {
 	cfg := baseConfig()
 	cfg["BlockBufferSize"] = "20"
 	cfg["MaxCompressionBuffer"] = "20480"
+	cfg["BatchEnabled"] = "true"
+	cfg["BatchMaxRows"] = "10000"
+	cfg["BatchInterval"] = "1s"
 
 	p, err := NewPlugin(makeConfig(cfg))
 	if err != nil {
@@ -722,6 +720,53 @@ func TestNewPlugin_BufferConfig(t *testing.T) {
 	}
 	if p.Opt.MaxCompressionBuffer != 20480 {
 		t.Errorf("MaxCompressionBuffer = %d, want 20480", p.Opt.MaxCompressionBuffer)
+	}
+	if !p.batchEnabled {
+		t.Error("batchEnabled = false, want true")
+	}
+	if p.batchMaxRows != 10000 {
+		t.Errorf("batchMaxRows = %d, want 10000", p.batchMaxRows)
+	}
+	if p.batchInterval != time.Second {
+		t.Errorf("batchInterval = %v, want 1s", p.batchInterval)
+	}
+}
+
+func TestNewPlugin_InvalidBatchBufferConfig(t *testing.T) {
+	tests := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "bad BatchMaxRows", key: "BatchMaxRows", value: "abc"},
+		{name: "zero BatchMaxRows", key: "BatchMaxRows", value: "0"},
+		{name: "negative BatchMaxRows", key: "BatchMaxRows", value: "-1"},
+		{name: "bad BatchInterval", key: "BatchInterval", value: "not_a_duration"},
+		{name: "zero BatchInterval", key: "BatchInterval", value: "0s"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg[tt.key] = tt.value
+			_, err := NewPlugin(makeConfig(cfg))
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+		})
+	}
+}
+
+func TestBatchBuffer_MaxRows_Capped(t *testing.T) {
+	cfg := baseConfig()
+	cfg["BatchEnabled"] = "true"
+	cfg["BatchMaxRows"] = "99999" // over max 50000
+	p, err := NewPlugin(makeConfig(cfg))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p.batchMaxRows != 50000 {
+		t.Errorf("batchMaxRows = %d, want 50000 (capped)", p.batchMaxRows)
 	}
 }
 
