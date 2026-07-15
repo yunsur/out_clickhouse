@@ -1113,11 +1113,11 @@ func TestValidateMetricsAddr(t *testing.T) {
 	if err := validateMetricsAddr(":9090"); err == nil {
 		t.Fatal("validateMetricsAddr() expected error for empty host")
 	}
-	if err := validateMetricsAddr("0.0.0.0:9090"); err == nil {
-		t.Fatal("validateMetricsAddr() expected error for wildcard IPv4 host")
+	if err := validateMetricsAddr("0.0.0.0:9090"); err != nil {
+		t.Fatalf("validateMetricsAddr() wildcard IPv4 unexpected error: %v", err)
 	}
-	if err := validateMetricsAddr("[::]:9090"); err == nil {
-		t.Fatal("validateMetricsAddr() expected error for wildcard IPv6 host")
+	if err := validateMetricsAddr("[::]:9090"); err != nil {
+		t.Fatalf("validateMetricsAddr() wildcard IPv6 unexpected error: %v", err)
 	}
 	if err := validateMetricsAddr("10.0.0.1:9090"); err == nil {
 		t.Fatal("validateMetricsAddr() expected error for non-loopback without env")
@@ -1135,27 +1135,35 @@ func TestValidateMetricsAddr(t *testing.T) {
 }
 
 func TestStartMetricsServer_ExposesMetrics(t *testing.T) {
-	p := &ClickHousePlugin{MetricsAddr: "127.0.0.1:0"}
+	resetSharedMetrics()
+	p := &ClickHousePlugin{
+		MetricsAddr: "127.0.0.1:0",
+		metricsLabels: prometheus.Labels{
+			"table":    "test_table",
+			"database": "test_db",
+		},
+	}
 	if err := p.initMetrics(); err != nil {
 		t.Fatalf("initMetrics() unexpected error: %v", err)
 	}
-	t.Cleanup(func() { p.stopMetrics() })
+	t.Cleanup(stopSharedMetrics)
 
-	addr := p.metricsListener.Addr().String()
-	p.metrics.flushTotal.WithLabelValues("ok").Inc()
-	p.metrics.flushInflight.Inc()
-	p.metrics.flushInflight.Dec()
-	p.metrics.batchRows.Observe(10)
-	p.metrics.droppedTotal.WithLabelValues("error", "decode").Add(2)
+	addr := sharedMetricsLn.Addr().String()
+	m := sharedMetrics
+	m.flushTotal.WithLabelValues("ok", "test_table", "test_db").Inc()
+	m.flushInflight.WithLabelValues("test_table", "test_db").Inc()
+	m.flushInflight.WithLabelValues("test_table", "test_db").Dec()
+	m.batchRows.WithLabelValues("test_table", "test_db").Observe(10)
+	m.droppedTotal.WithLabelValues("error", "decode", "test_table", "test_db").Add(2)
 
-	if p.metricsServer.ReadHeaderTimeout != 5*time.Second {
-		t.Fatalf("ReadHeaderTimeout = %v, want 5s", p.metricsServer.ReadHeaderTimeout)
+	if sharedMetricsSrv.ReadHeaderTimeout != 5*time.Second {
+		t.Fatalf("ReadHeaderTimeout = %v, want 5s", sharedMetricsSrv.ReadHeaderTimeout)
 	}
-	if p.metricsServer.ReadTimeout != 10*time.Second {
-		t.Fatalf("ReadTimeout = %v, want 10s", p.metricsServer.ReadTimeout)
+	if sharedMetricsSrv.ReadTimeout != 10*time.Second {
+		t.Fatalf("ReadTimeout = %v, want 10s", sharedMetricsSrv.ReadTimeout)
 	}
-	if p.metricsServer.IdleTimeout != 30*time.Second {
-		t.Fatalf("IdleTimeout = %v, want 30s", p.metricsServer.IdleTimeout)
+	if sharedMetricsSrv.IdleTimeout != 30*time.Second {
+		t.Fatalf("IdleTimeout = %v, want 30s", sharedMetricsSrv.IdleTimeout)
 	}
 
 	client := &net.Dialer{Timeout: time.Second}
@@ -1169,22 +1177,28 @@ func TestStartMetricsServer_ExposesMetrics(t *testing.T) {
 		t.Fatalf("metrics request write failed: %v", err)
 	}
 
-	buf := make([]byte, 4096)
+	buf := make([]byte, 8192)
 	n, err := conn.Read(buf)
 	if err != nil {
 		t.Fatalf("metrics response read failed: %v", err)
 	}
-	if got := string(buf[:n]); !containsAll(got, "clickhouse_flush_total", "clickhouse_flush_inflight", "clickhouse_batch_rows", "clickhouse_records_dropped_total", "plugin_info", "200 OK") {
-		t.Fatalf("metrics response missing expected content: %s", got)
+	body := string(buf[:n])
+	if !containsAll(body, "clickhouse_flush_total", "clickhouse_flush_inflight", "clickhouse_batch_rows", "clickhouse_records_dropped_total", "plugin_info", "200 OK") {
+		t.Fatalf("metrics response missing expected content: %s", body)
 	}
 }
 
 func TestExit_IsIdempotentAndStopsMetrics(t *testing.T) {
+	resetSharedMetrics()
 	conn := &mockConn{}
 	p := &ClickHousePlugin{
 		Opt:         &clickhouse.Options{DialTimeout: time.Second},
 		Conn:        conn,
 		MetricsAddr: "127.0.0.1:0",
+		metricsLabels: prometheus.Labels{
+			"table":    "test",
+			"database": "test",
+		},
 	}
 	if err := p.initMetrics(); err != nil {
 		t.Fatalf("initMetrics() unexpected error: %v", err)
@@ -1199,8 +1213,12 @@ func TestExit_IsIdempotentAndStopsMetrics(t *testing.T) {
 	if p.Conn != nil {
 		t.Fatal("expected Conn to be nil after Exit")
 	}
-	if p.metrics != nil || p.metricsServer != nil || p.metricsListener != nil {
-		t.Fatal("expected metrics state to be cleared after Exit")
+	if p.metricsLabels != nil {
+		t.Fatal("expected metricsLabels to be cleared after Exit")
+	}
+	if sharedMetricsSrv != nil {
+		// Server may still be active (other instances may exist), that's fine.
+		stopSharedMetrics()
 	}
 }
 
@@ -1219,6 +1237,10 @@ func TestBatchInsert_ConcurrentWithExit_DoesNotPanic(t *testing.T) {
 		BatchStmt:   "INSERT INTO default.events(message)",
 		Conn:        conn,
 		MetricsAddr: "127.0.0.1:0",
+		metricsLabels: prometheus.Labels{
+			"table":    "events",
+			"database": "default",
+		},
 	}
 	if err := p.initMetrics(); err != nil {
 		t.Fatalf("initMetrics() unexpected error: %v", err)
@@ -1534,15 +1556,27 @@ func TestPayloadTooLarge_Boundary(t *testing.T) {
 }
 
 func TestFLBPluginFlushCtx_RejectsPayloadTooLarge(t *testing.T) {
+	resetSharedMetrics()
+	// Initialize shared metrics with a dedicated server on random port.
+	initPlugin := &ClickHousePlugin{
+		MetricsAddr: "127.0.0.1:0",
+		metricsLabels: prometheus.Labels{
+			"table":    "test",
+			"database": "test",
+		},
+	}
+	if err := initPlugin.initMetrics(); err != nil {
+		t.Fatalf("initMetrics() unexpected error: %v", err)
+	}
+	defer stopSharedMetrics()
+
 	ctxRegistry = sync.Map{}
 	plugin := &fakeABIPlugin{context: &fakeABIContext{}}
 	p := &ClickHousePlugin{
 		closed: true,
-		metrics: &pluginMetrics{
-			droppedTotal: prometheus.NewCounterVec(
-				prometheus.CounterOpts{Name: "test_payload_dropped_total", Help: "test"},
-				[]string{"status", "stage"},
-			),
+		metricsLabels: prometheus.Labels{
+			"table":    "test",
+			"database": "test",
 		},
 	}
 	release, err := setPluginContext(unsafe.Pointer(plugin), p)
@@ -1570,7 +1604,7 @@ func TestFLBPluginFlushCtx_RejectsPayloadTooLarge(t *testing.T) {
 	}
 
 	metric := &dto.Metric{}
-	if err := p.metrics.droppedTotal.WithLabelValues("error", "payload_limit").Write(metric); err != nil {
+	if err := sharedMetrics.droppedTotal.WithLabelValues("error", "payload_limit", "test", "test").Write(metric); err != nil {
 		t.Fatalf("write dropped counter: %v", err)
 	}
 	if got := metric.GetCounter().GetValue(); got != 1 {

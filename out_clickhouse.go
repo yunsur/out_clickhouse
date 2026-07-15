@@ -180,10 +180,7 @@ func FLBPluginFlushCtx(ctxPtr, data unsafe.Pointer, length C.int, tag *C.char) i
 		}
 		if payloadTooLarge(length) {
 			p.logErrorf("flush failed: payload too large length=%d limit=%d", int(length), maxFlushPayloadBytes)
-			p.mu.RLock()
-			metrics := p.metrics
-			p.mu.RUnlock()
-			observeDroppedRows(metrics, output.FLB_ERROR, "payload_limit", 1)
+			p.observeDroppedRows(output.FLB_ERROR, "payload_limit", 1)
 			return output.FLB_ERROR
 		}
 		tagValue := ""

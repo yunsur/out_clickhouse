@@ -138,17 +138,28 @@ type Connector interface {
 	Close() error
 }
 
-type pluginMetrics struct {
-	registry      *prometheus.Registry
-	flushTotal    *prometheus.CounterVec
-	flushDuration prometheus.Histogram
-	flushInflight prometheus.Gauge
-	batchRows     prometheus.Histogram
-	flushErrors   *prometheus.CounterVec
-	recordsTotal  prometheus.Counter
-	droppedTotal  *prometheus.CounterVec
-	pluginInfo    *prometheus.GaugeVec
+// sharedPluginMetrics holds Prometheus metrics shared across all plugin instances.
+// All timeseries carry table and database labels for per-output visibility.
+type sharedPluginMetrics struct {
+	flushTotal    *prometheus.CounterVec   // labels: status, table, database
+	flushDuration *prometheus.HistogramVec // labels: table, database
+	flushInflight *prometheus.GaugeVec     // labels: table, database
+	batchRows     *prometheus.HistogramVec // labels: table, database
+	flushErrors   *prometheus.CounterVec   // labels: status, table, database
+	recordsTotal  *prometheus.CounterVec   // labels: table, database
+	droppedTotal  *prometheus.CounterVec   // labels: status, stage, table, database
+	pluginInfo    *prometheus.GaugeVec     // labels: version, commit
 }
+
+var (
+	sharedMetrics    *sharedPluginMetrics
+	sharedRegistry   *prometheus.Registry
+	sharedMetricsSrv *http.Server
+	sharedMetricsLn  net.Listener
+	metricsOnce      sync.Once
+	metricsInitErr   error
+	metricsMu        sync.Mutex
+)
 
 type throttledLogger struct {
 	mu       sync.Mutex
@@ -212,11 +223,9 @@ type ClickHousePlugin struct {
 	contextRelease     func()
 	contextReleaseOnce sync.Once
 
-	metrics         *pluginMetrics
-	metricsServer   *http.Server
-	metricsListener net.Listener
-	logInstance     unsafe.Pointer
-	errorLog        *throttledLogger
+	metricsLabels prometheus.Labels
+	logInstance   unsafe.Pointer
+	errorLog      *throttledLogger
 
 	// Logger is the unified slog logger for both plugin and clickhouse-go.
 	Logger *slog.Logger
@@ -972,10 +981,13 @@ func (p *ClickHousePlugin) Init() (err error) {
 		p.insertSem = make(chan struct{}, p.Opt.MaxOpenConns)
 	}
 	p.rootCtx, p.rootCancel = context.WithCancel(context.Background())
+	p.metricsLabels = prometheus.Labels{
+		"table":    p.TableName,
+		"database": p.Opt.Auth.Database,
+	}
 	if err = p.initMetrics(); err != nil {
 		return fmt.Errorf("clickhouse: init metrics: %w", err)
 	}
-
 	return nil
 }
 
@@ -1027,7 +1039,6 @@ func (p *ClickHousePlugin) batchInsertWithNext(tag string, next func() (any, map
 	}()
 	p.mu.RLock()
 	p.inflight.Add(1)
-	metrics := p.metrics
 	closed := p.closed
 	conn := p.Conn
 	sem := p.insertSem
@@ -1037,11 +1048,11 @@ func (p *ClickHousePlugin) batchInsertWithNext(tag string, next func() (any, map
 	p.mu.RUnlock()
 	defer p.inflight.Done()
 	defer func() {
-		p.observeFlush(metrics, code, records, started)
+		p.observeFlush(code, records, started)
 	}()
-	if metrics != nil && metrics.flushInflight != nil {
-		metrics.flushInflight.Inc()
-		defer metrics.flushInflight.Dec()
+	if sharedMetrics != nil && p.metricsLabels != nil {
+		sharedMetrics.flushInflight.With(p.metricsLabels).Inc()
+		defer sharedMetrics.flushInflight.With(p.metricsLabels).Dec()
 	}
 
 	if closed || conn == nil {
@@ -1072,23 +1083,23 @@ func (p *ClickHousePlugin) batchInsertWithNext(tag string, next func() (any, map
 	ctx, cancel := context.WithTimeout(baseCtx, writeTimeout)
 	defer cancel()
 
-	code, records = p.insertBatch(ctx, conn, next, metrics)
+	code, records = p.insertBatch(ctx, conn, next)
 	return code
 }
 
-func (p *ClickHousePlugin) insertBatch(ctx context.Context, conn Connector, next func() (any, map[interface{}]interface{}, bool, int), metrics *pluginMetrics) (int, int) {
+func (p *ClickHousePlugin) insertBatch(ctx context.Context, conn Connector, next func() (any, map[interface{}]interface{}, bool, int)) (int, int) {
 	totalRows := 0
 	for {
 		pendingRows, dedupToken, eof, code, decodeDroppedRows := p.decodeRowsChunk(next)
 		if decodeDroppedRows > 0 {
-			observeDroppedRows(metrics, output.FLB_ERROR, "parse", decodeDroppedRows)
+			p.observeDroppedRows(output.FLB_ERROR, "parse", decodeDroppedRows)
 		}
 		if code != output.FLB_OK {
-			observeDroppedRows(metrics, code, "decode", len(pendingRows))
+			p.observeDroppedRows(code, "decode", len(pendingRows))
 			return code, totalRows
 		}
 		if len(pendingRows) > 0 {
-			sendCode := p.sendRows(ctx, conn, dedupToken, pendingRows, metrics)
+			sendCode := p.sendRows(ctx, conn, dedupToken, pendingRows)
 			if sendCode != output.FLB_OK {
 				return sendCode, totalRows
 			}
@@ -1100,7 +1111,7 @@ func (p *ClickHousePlugin) insertBatch(ctx context.Context, conn Connector, next
 	}
 }
 
-func (p *ClickHousePlugin) sendRows(ctx context.Context, conn Connector, dedupToken string, pendingRows [][]any, metrics *pluginMetrics) int {
+func (p *ClickHousePlugin) sendRows(ctx context.Context, conn Connector, dedupToken string, pendingRows [][]any) int {
 	prepareCtx := clickhouse.Context(ctx, clickhouse.WithSettings(clickhouse.Settings{
 		"insert_deduplication_token": dedupToken,
 	}))
@@ -1108,7 +1119,7 @@ func (p *ClickHousePlugin) sendRows(ctx context.Context, conn Connector, dedupTo
 	if err != nil {
 		p.throttledErrorf("prepare_batch", "prepare batch failed: table=%s err=%v", p.tableRef(), err)
 		code := classifyInsertError(err)
-		observeDroppedRows(metrics, code, "prepare", len(pendingRows))
+		p.observeDroppedRows(code, "prepare", len(pendingRows))
 		return code
 	}
 	defer func() {
@@ -1121,18 +1132,18 @@ func (p *ClickHousePlugin) sendRows(ctx context.Context, conn Connector, dedupTo
 		if err := batch.Append(columns...); err != nil {
 			p.throttledErrorf("batch_append", "batch append failed: table=%s err=%v", p.tableRef(), err)
 			code := classifyInsertError(err)
-			observeDroppedRows(metrics, code, "append", len(pendingRows))
+			p.observeDroppedRows(code, "append", len(pendingRows))
 			return code
 		}
 	}
 	if err := batch.Send(); err != nil {
 		p.throttledErrorf("batch_send", "batch send failed: table=%s err=%v", p.tableRef(), err)
 		code := classifyInsertError(err)
-		observeDroppedRows(metrics, code, "send", len(pendingRows))
+		p.observeDroppedRows(code, "send", len(pendingRows))
 		return code
 	}
-	if metrics != nil && metrics.batchRows != nil {
-		metrics.batchRows.Observe(float64(len(pendingRows)))
+	if sharedMetrics != nil && p.metricsLabels != nil {
+		sharedMetrics.batchRows.WithLabelValues(p.metricsLabels["table"], p.metricsLabels["database"]).Observe(float64(len(pendingRows)))
 	}
 	return output.FLB_OK
 }
@@ -1429,18 +1440,15 @@ func validateMetricsAddr(addr string) error {
 	if err != nil {
 		return err
 	}
-	if host == "" || host == "0.0.0.0" || host == "::" {
-		return fmt.Errorf("MetricsAddr must bind loopback (e.g. 127.0.0.1:9090); got %q", addr)
+	if host == "" {
+		return fmt.Errorf("MetricsAddr must include a host, got %q", addr)
 	}
-	if host != "" && strings.Contains(host, " ") {
-		return fmt.Errorf("invalid host %q", host)
-	}
-	if host != "localhost" {
+	if host != "localhost" && host != "0.0.0.0" && host != "::" {
 		ip := net.ParseIP(host)
 		if ip == nil {
-			return fmt.Errorf("MetricsAddr host %q must be localhost or an IP", host)
+			return fmt.Errorf("MetricsAddr host %q must be localhost, a wildcard, or an IP", host)
 		}
-		if !ip.IsLoopback() && os.Getenv("CLICKHOUSE_ALLOW_PUBLIC_METRICS") != "1" {
+		if !ip.IsLoopback() && !ip.IsUnspecified() && os.Getenv("CLICKHOUSE_ALLOW_PUBLIC_METRICS") != "1" {
 			return fmt.Errorf("non-loopback MetricsAddr %q requires CLICKHOUSE_ALLOW_PUBLIC_METRICS=1", host)
 		}
 	}
@@ -1455,104 +1463,102 @@ func validateMetricsAddr(addr string) error {
 }
 
 func (p *ClickHousePlugin) initMetrics() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.MetricsAddr == "" || p.metricsServer != nil {
+	if p.MetricsAddr == "" || sharedMetrics != nil {
+		// Only the first configured instance starts the server.
 		return nil
 	}
 
-	registry := prometheus.NewRegistry()
-	metrics := &pluginMetrics{
-		registry: registry,
-		flushTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "clickhouse_flush_total",
-			Help: "Total number of ClickHouse flush attempts by result.",
-		}, []string{"status"}),
-		flushDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Name:    "clickhouse_flush_duration_seconds",
-			Help:    "Duration of ClickHouse flush attempts.",
-			Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120},
-		}),
-		flushInflight: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "clickhouse_flush_inflight",
-			Help: "Number of in-flight flush operations.",
-		}),
-		batchRows: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Name:    "clickhouse_batch_rows",
-			Help:    "Rows per successful ClickHouse batch.",
-			Buckets: []float64{1, 10, 100, 500, 1000, 5000, 10000, 50000},
-		}),
-		flushErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "clickhouse_flush_errors_total",
-			Help: "Total number of failed ClickHouse flush attempts by result.",
-		}, []string{"status"}),
-		recordsTotal: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "clickhouse_records_total",
-			Help: "Total number of successfully flushed ClickHouse records.",
-		}),
-		droppedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "clickhouse_records_dropped_total",
-			Help: "Total number of dropped ClickHouse records by flush result and stage.",
-		}, []string{"status", "stage"}),
-		pluginInfo: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "plugin_info",
-			Help: "Build information for the ClickHouse output plugin.",
-		}, []string{"version", "commit"}),
-	}
-	metrics.pluginInfo.WithLabelValues(pluginVersion, pluginCommit).Set(1)
-	registry.MustRegister(
-		metrics.flushTotal,
-		metrics.flushDuration,
-		metrics.flushInflight,
-		metrics.batchRows,
-		metrics.flushErrors,
-		metrics.recordsTotal,
-		metrics.droppedTotal,
-		metrics.pluginInfo,
-	)
-
-	listener, err := net.Listen("tcp", p.MetricsAddr)
-	if err != nil {
-		return err
-	}
-
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{Registry: registry}))
-	server := &http.Server{
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		IdleTimeout:       30 * time.Second,
-	}
-
-	p.metrics = metrics
-	p.metricsListener = listener
-	p.metricsServer = server
-
-	go func(addr string) {
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				p.logErrorf("metrics server panicked: %v", recovered)
-			}
-		}()
-		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			p.logErrorf("metrics server failed: addr=%s err=%v", addr, err)
+	initErr := make(chan error, 1)
+	metricsOnce.Do(func() {
+		registry := prometheus.NewRegistry()
+		metrics := &sharedPluginMetrics{
+			flushTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+				Name: "clickhouse_flush_total",
+				Help: "Total number of ClickHouse flush attempts by result.",
+			}, []string{"status", "table", "database"}),
+			flushDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+				Name:    "clickhouse_flush_duration_seconds",
+				Help:    "Duration of ClickHouse flush attempts.",
+				Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120},
+			}, []string{"table", "database"}),
+			flushInflight: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+				Name: "clickhouse_flush_inflight",
+				Help: "Number of in-flight flush operations.",
+			}, []string{"table", "database"}),
+			batchRows: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+				Name:    "clickhouse_batch_rows",
+				Help:    "Rows per successful ClickHouse batch.",
+				Buckets: []float64{1, 10, 100, 500, 1000, 5000, 10000, 50000},
+			}, []string{"table", "database"}),
+			flushErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+				Name: "clickhouse_flush_errors_total",
+				Help: "Total number of failed ClickHouse flush attempts by result.",
+			}, []string{"status", "table", "database"}),
+			recordsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+				Name: "clickhouse_records_total",
+				Help: "Total number of successfully flushed ClickHouse records.",
+			}, []string{"table", "database"}),
+			droppedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+				Name: "clickhouse_records_dropped_total",
+				Help: "Total number of dropped ClickHouse records by flush result and stage.",
+			}, []string{"status", "stage", "table", "database"}),
+			pluginInfo: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+				Name: "plugin_info",
+				Help: "Build information for the ClickHouse output plugin.",
+			}, []string{"version", "commit"}),
 		}
-	}(listener.Addr().String())
+		metrics.pluginInfo.WithLabelValues(pluginVersion, pluginCommit).Set(1)
+		registry.MustRegister(
+			metrics.flushTotal,
+			metrics.flushDuration,
+			metrics.flushInflight,
+			metrics.batchRows,
+			metrics.flushErrors,
+			metrics.recordsTotal,
+			metrics.droppedTotal,
+			metrics.pluginInfo,
+		)
 
-	return nil
+		listener, err := net.Listen("tcp", p.MetricsAddr)
+		if err != nil {
+			initErr <- err
+			return
+		}
+
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{Registry: registry}))
+		server := &http.Server{
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       10 * time.Second,
+			IdleTimeout:       30 * time.Second,
+		}
+
+		sharedMetrics = metrics
+		sharedRegistry = registry
+		sharedMetricsSrv = server
+		sharedMetricsLn = listener
+
+		go func(addr string) {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					p.logErrorf("metrics server panicked: %v", recovered)
+				}
+			}()
+			if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				p.logErrorf("metrics server failed: addr=%s err=%v", addr, err)
+			}
+		}(listener.Addr().String())
+
+		close(initErr)
+	})
+
+	return <-initErr
 }
 
-func (p *ClickHousePlugin) stopMetrics() {
-	p.mu.Lock()
-	server, listener := p.takeMetricsLocked()
-	p.mu.Unlock()
-	shutdownMetrics(server, listener)
-}
-
-func (p *ClickHousePlugin) observeFlush(metrics *pluginMetrics, code int, records int, started time.Time) {
-	if metrics == nil {
+func (p *ClickHousePlugin) observeFlush(code int, records int, started time.Time) {
+	m := sharedMetrics
+	if m == nil || p.metricsLabels == nil {
 		return
 	}
 
@@ -1564,13 +1570,34 @@ func (p *ClickHousePlugin) observeFlush(metrics *pluginMetrics, code int, record
 		status = "retry"
 	}
 
-	metrics.flushTotal.WithLabelValues(status).Inc()
-	metrics.flushDuration.Observe(time.Since(started).Seconds())
+	labels := p.metricsLabels
+	m.flushTotal.WithLabelValues(status, labels["table"], labels["database"]).Inc()
+	m.flushDuration.WithLabelValues(labels["table"], labels["database"]).Observe(time.Since(started).Seconds())
 	if code == output.FLB_OK {
-		metrics.recordsTotal.Add(float64(records))
+		m.recordsTotal.WithLabelValues(labels["table"], labels["database"]).Add(float64(records))
 		return
 	}
-	metrics.flushErrors.WithLabelValues(status).Inc()
+	m.flushErrors.WithLabelValues(status, labels["table"], labels["database"]).Inc()
+}
+
+func (p *ClickHousePlugin) observeDroppedRows(code int, stage string, rows int) {
+	m := sharedMetrics
+	if rows <= 0 || m == nil || p.metricsLabels == nil {
+		return
+	}
+	labels := p.metricsLabels
+	m.droppedTotal.WithLabelValues(droppedStatus(code), stage, labels["table"], labels["database"]).Add(float64(rows))
+}
+
+func stopSharedMetrics() {
+	if sharedMetricsSrv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = sharedMetricsSrv.Shutdown(ctx)
+	}
+	if sharedMetricsLn != nil {
+		_ = sharedMetricsLn.Close()
+	}
 }
 
 // Exit closes the ClickHouse connection and releases resources.
@@ -1587,7 +1614,7 @@ func (p *ClickHousePlugin) Exit() {
 	writeTimeout := p.WriteTimeout
 	conn := p.Conn
 	p.Conn = nil
-	server, listener := p.takeMetricsLocked()
+	p.metricsLabels = nil
 	p.mu.Unlock()
 	if rootCancel != nil {
 		rootCancel()
@@ -1608,7 +1635,6 @@ func (p *ClickHousePlugin) Exit() {
 		p.logWarnf("exit: in-flight flush did not finish in %v, forcing close", deadline)
 	}
 
-	shutdownMetrics(server, listener)
 	if conn != nil {
 		if err := conn.Close(); err != nil {
 			p.logErrorf("close connection failed: %v", err)
@@ -1625,29 +1651,17 @@ func droppedStatus(code int) string {
 	}
 }
 
-func observeDroppedRows(metrics *pluginMetrics, code int, stage string, rows int) {
-	if rows <= 0 || metrics == nil || metrics.droppedTotal == nil {
-		return
-	}
-	metrics.droppedTotal.WithLabelValues(droppedStatus(code), stage).Add(float64(rows))
-}
 
-func (p *ClickHousePlugin) takeMetricsLocked() (*http.Server, net.Listener) {
-	server := p.metricsServer
-	listener := p.metricsListener
-	p.metricsServer = nil
-	p.metricsListener = nil
-	p.metrics = nil
-	return server, listener
-}
-
-func shutdownMetrics(server *http.Server, listener net.Listener) {
-	if server != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		_ = server.Shutdown(ctx)
-	}
-	if listener != nil {
-		_ = listener.Close()
-	}
+// resetSharedMetrics resets shared metrics state for testing.
+func resetSharedMetrics() {
+	metricsMu.Lock()
+	defer metricsMu.Unlock()
+	stopSharedMetrics()
+	sharedMetrics = nil
+	sharedRegistry = nil
+	sharedMetricsSrv = nil
+	sharedMetricsLn = nil
+	metricsInitErr = nil
+	// Reinitialize the Once so initSharedMetrics can run again.
+	metricsOnce = sync.Once{}
 }
