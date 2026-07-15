@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - GOARCH: amd64
+            LABEL: x86_64
+            CC_PKG: gcc
+            CC_BIN: gcc
+          - GOARCH: arm64
+            LABEL: arm64
+            CC_PKG: gcc-aarch64-linux-gnu
+            CC_BIN: aarch64-linux-gnu-gcc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check arch filter
+        id: filter
+        run: |
+          # Always build all architectures on tag push.
+          # On workflow_dispatch, also build all architectures.
+          echo "skip=false" >> $GITHUB_OUTPUT
+
+      - name: Install cross-compiler
+        if: steps.filter.outputs.skip != 'true' && matrix.CC_PKG != 'gcc'
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.CC_PKG }}
+
+      - name: Build for linux/${{ matrix.GOARCH }}
+        if: steps.filter.outputs.skip != 'true'
+        run: |
+          CGO_ENABLED=1 \
+          GOOS=linux GOARCH=${{ matrix.GOARCH }} \
+          CC=${{ matrix.CC_BIN }} \
+          CGO_CFLAGS="-O2 -fstack-protector-all -D_FORTIFY_SOURCE=2" \
+          CGO_LDFLAGS="-Wl,-z,relro,-z,now,-z,noexecstack -fstack-protector-all" \
+          go build -buildmode=c-shared \
+            -ldflags="-s -w -X main.pluginVersion=${{ steps.version.outputs.tag }} -X main.pluginCommit=${GITHUB_SHA::7}" \
+            -o out_clickhouse.so
+
+      - name: Package
+        if: steps.filter.outputs.skip != 'true'
+        run: |
+          PKG="out_clickhouse-linux-${{ matrix.LABEL }}-${{ steps.version.outputs.tag }}"
+          mkdir -p dist
+          cp out_clickhouse.so dist/
+          cp out_clickhouse.h dist/
+          cp README.md dist/
+          cp CONTEXT.md dist/ 2>/dev/null || true
+          cp -r docs dist/ 2>/dev/null || true
+          cd dist
+          sha256sum out_clickhouse.so > out_clickhouse.so.sha256
+          tar czf "${PKG}.tgz" \
+            out_clickhouse.so out_clickhouse.h out_clickhouse.so.sha256 README.md
+          echo "pkg_name=${PKG}.tgz" >> $GITHUB_OUTPUT
+        id: package
+
+
+      - name: Attach to Release
+        if: steps.filter.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          name: Release ${{ steps.version.outputs.tag }}
+          tag_name: ${{ steps.version.outputs.tag }}
+          files: dist/${{ steps.package.outputs.pkg_name }}
+          generate_release_notes: true

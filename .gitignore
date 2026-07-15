@@ -3,3 +3,4 @@
 .env
 out_clickhouse.h
 out_clickhouse.so
+out_clickhouse
